@@ -1,0 +1,246 @@
+---
+title: "Sampling Report Background"
+author: "Emma Jones"
+date: "5/20/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(config)
+library(sf)
+library(plotly)
+library(lubridate)
+library(pool)
+library(pins)
+library(sqldf)
+
+# Server connection things
+conn <- config::get("connectionSettings") # get configuration settings
+board_register_rsconnect(key = conn$CONNECT_API_KEY,  #Sys.getenv("CONNECT_API_KEY"),
+                         server = conn$CONNECT_SERVER)#Sys.getenv("CONNECT_SERVER"))
+
+pool <- dbPool(
+ drv = odbc::odbc(),
+ Driver = "ODBC Driver 11 for SQL Server",#"SQL Server Native Client 11.0",
+ Server= "DEQ-SQLODS-PROD,50000",
+ dbname = "ODS",
+ trusted_connection = "yes")
+
+# for general DB understanding use DBI 
+con <- dbConnect(odbc::odbc(), .connection_string = "driver={ODBC Driver 11 for SQL Server};server={DEQ-SQLODS-PROD,50000};database={ODS};trusted_connection=yes")
+
+```
+
+## Purpose
+
+The purpose of this project is to create a system for various user levels (monitoring staff through managers) to better understand the monitoring data collected in a more real time manner. This tool will aid in data entry QA (reviewing data issues before they roll around to the assessment), track sample collection metrics (are all runs- especially high frequency- and sample QA needs), afford better understanding of sample results (exceedances) in real time for better planning and communications for monitoring, assessment, TMDL, and management staff. 
+
+The initial build out will focus on high frequency monitoring reported at a weekly to monthly schedule, but the logic will be flexible enough to convert to all sampling activities (ambient, TMDL, biomonitoring, etc.) over multiple time scales (weekly, monthly, year to date, custom, etc.).
+
+
+## Bring in useful pinned data
+
+This dataset is rerun weekly and does a ton of spatial indentification for stations in WQM_Stations_View. WQS info is critical for any exceedance analysis.
+```{r}
+WQM_Stations_Spatial <- pin_get("ejones/WQM-Stations-Spatial", board = "rsconnect") %>%
+  rename("Basin_Name" = "Basin_Code") # can't have same name different case when using sqldf
+WQSlookup <- pin_get("WQSlookup-withStandards",  board = "rsconnect")
+
+```
+
+And functions originally from other projects that are useful here. Some have been minimally altered to work with this data from CEDS.
+
+```{r}
+source('WQMqueryToolFunctions.R')
+source('assessmentFunctions.R')
+```
+
+
+
+## Identify runs by region
+
+Need to first identify a window for analysis.
+
+```{r}
+sampleWindow <- c(as.Date('2021-05-01'), as.Date('2021-05-31'))
+```
+
+What basic data can we glean from Wqm_Field_Data_View plus some spatial info from the R server?
+
+```{r}
+windowInfo <- pool %>% tbl( "Wqm_Field_Data_View") %>%
+  filter(between(as.Date(Fdt_Date_Time), !! sampleWindow[1], !! sampleWindow[2])) %>%
+  as_tibble() %>% 
+  left_join(WQM_Stations_Spatial, by = c("Fdt_Sta_Id" = "StationID")) #%>% 
+  #rename("Fdt_Sta_Id" = "Fdt_Sta_Id", 'Fdt_Date_Time' = 'Fdt_Date_Time')
+```
+
+Summary info available by join:
+ 
+- how many runs done by region in time period
+- how many stations sampled by region in time period
+- rough workload balance statewide- good for resource reallocation
+```{r}
+windowInfo %>% 
+  group_by(ASSESS_REG) %>% 
+  summarise(`Number of Runs Completed` = length(unique(Fdt_Run_Id)),
+            `Number of Stations Sampled` = length(unique(Fdt_Sta_Id))) %>% 
+  mutate(`Total Runs Completed Statewide` = sum(`Number of Runs Completed`, na.rm = T),
+         `Total Stations Sampled Statewide` = sum(`Number of Stations Sampled`, na.rm = T),
+         `Percentage of Statewide Runs` = round(`Number of Runs Completed`/`Total Runs Completed Statewide` * 100, digits = 1),
+         `Percentage of Statewide Stations` = round(`Number of Stations Sampled`/`Total Stations Sampled Statewide` * 100, digits = 1))
+```
+
+Link up WQS information as available.
+
+```{r}
+windowInfoWQS <- windowInfo %>% 
+  left_join(WQSlookup, by = c('Fdt_Sta_Id'='StationID')) %>%
+  mutate(CLASS_BASIN = paste(CLASS,substr(BASIN, 1,1), sep="_")) %>%
+  mutate(CLASS_BASIN = ifelse(CLASS_BASIN == 'II_7', "II_7", as.character(CLASS))) %>%
+  # Fix for Class II Tidal Waters in Chesapeake (bc complicated DO/temp/etc standard)
+  left_join(WQSvalues, by = 'CLASS_BASIN') %>%
+  dplyr::select(-c(CLASS.y,CLASS_BASIN)) %>%
+  rename('CLASS' = 'CLASS.x') %>% 
+  pHSpecialStandardsCorrection() %>% 
+  thermoclineDepth()
+```
+
+Any field data exceedances?
+
+```{r}
+windowExceedanceAnalysis <- windowInfoWQS %>% 
+  filter(!is.na(WQS_ID)) %>% 
+  rowwise() %>% 
+  mutate(`Temperature Exceedance` = ifelse( signif(Fdt_Temp_Celcius, digits = 2) > `Max Temperature (C)`, 1, 0),
+         `pH Exceedance` = ifelse(findInterval( signif(Fdt_Field_Ph, digits = 2),c(`pH Min`,`pH Max`), left.open=TRUE, rightmost.closed = TRUE) == 1, 0, 1), 
+         # a bit of reverse logic bc findInterval returns 1 when inside interval, so have to throw opposite to get accurate exceedance count
+         `pH Exceedance Lake Correction` = case_when(LakeStratification %in% c('Epilimnion', NA) & `pH Exceedance` == 1 ~ 1,
+                                                     LakeStratification %in% c('Hypolimnion') & `pH Exceedance` == 1 ~ 0,
+                                                     TRUE ~ as.numeric(`pH Exceedance`)),
+         # drop any pH exceedances in the hypolimnion to adhere with assessment guidance
+         `Dissolved Oxygen Exceedance` =  ifelse(signif(Fdt_Do_Optical , digits = 2) < `Dissolved Oxygen Min (mg/L)`,1,0))
+
+windowExceedances <- filter(windowExceedanceAnalysis, `Temperature Exceedance` == 1 | `pH Exceedance` == 1 |  `Dissolved Oxygen Exceedance` == 1 ) %>% 
+  group_by(Fdt_Sta_Id, ASSESS_REG) %>% 
+  summarise(`Temperature Exceedance` = sum(`Temperature Exceedance`, na.rm = T), 
+            `pH Exceedance` = sum(`pH Exceedance Lake Correction`, na.rm = T), 
+            `Dissolved Oxygen Exceedance` = sum(`Dissolved Oxygen Exceedance`, na.rm = T))
+
+# quick way of getting answers
+View(
+windowExceedances %>% ungroup() %>% 
+  group_by(ASSESS_REG) %>% 
+  summarise(`Temperature Exceedance` = sum(`Temperature Exceedance`, na.rm = T), 
+            `pH Exceedance` = sum(`pH Exceedance`, na.rm = T), 
+            `Dissolved Oxygen Exceedance` = sum(`Dissolved Oxygen Exceedance`, na.rm = T)) %>% 
+  left_join(windowInfoWQS %>% 
+              distinct(Fdt_Sta_Id, .keep_all = T) %>% 
+              group_by(ASSESS_REG) %>% 
+              count(!is.na(WQS_ID)) %>% 
+              mutate(sites = sum(n), 
+                     `Percent of Stations With WQS Information` = case_when(`!is.na(WQS_ID)` == TRUE ~ round(n / sites *100, digits = 1 ))) %>% 
+              filter(!is.na(`Percent of Stations With WQS Information`)) %>% 
+              dplyr::select(ASSESS_REG, `Number of Stations Sampled` = sites, `Percent of Stations With WQS Information`), 
+            by = 'ASSESS_REG') )
+## nest data that exceeds with each region??
+# other option is to build application to summarise table above and then when user wants to dig in to exceedances show table of windowExceedances filtered by region so they can see what stations blew for what parameter, then allow user to plot individual stations so they can see the whole data collected with exceedance highlighted in plotly scatterplot
+
+
+```
+
+## Analyte data needs to come in next
+- flag TP > 0.02 mg/L
+- flag TN > 2 mg/L
+- run new bacteria exceedance analysis
+- metals exceedances?
+
+First pull analyte data for the stations and dates (by windowInfo$Fdt_Id)
+
+```{r}
+windowInfoAnalytes <- pool %>% tbl("Wqm_Analytes_View") %>%
+  filter(Ana_Sam_Fdt_Id %in% !! windowInfo$Fdt_Id  &
+           between(as.Date(Ana_Received_Date), !! sampleWindow[1], !! sampleWindow[2]) & # x >= left & x <= right
+           Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") %>% 
+  as_tibble() %>%
+  left_join(dplyr::select(windowInfo, Fdt_Id, Fdt_Sta_Id, Fdt_Date_Time), by = c("Ana_Sam_Fdt_Id" = "Fdt_Id"))
+
+basicData <- basicSummary(stationFieldAnalyteDataPretty(windowInfoAnalytes, windowInfo, averageResults = TRUE)) %>% 
+  left_join(dplyr::select(windowInfoWQS,Fdt_Sta_Id, Fdt_Date_Time, Fdt_Depth, ), by = 'Fdt_Id')
+
+```
+
+
+## side step: one function to rule them all
+
+```{r}
+windowInfo <- pool %>% tbl( "Wqm_Field_Data_View") %>%
+  filter(between(as.Date(Fdt_Date_Time), !! sampleWindow[1], !! sampleWindow[2])) %>%
+  as_tibble()
+
+windowInfoAnalytes <- pool %>% tbl("Wqm_Analytes_View") %>%
+  filter(Ana_Sam_Fdt_Id %in% !! windowInfo$Fdt_Id  &
+           between(as.Date(Ana_Received_Date), !! sampleWindow[1], !! sampleWindow[2]) & # x >= left & x <= right
+           Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") %>% 
+  as_tibble() %>%
+  left_join(dplyr::select(windowInfo1, Fdt_Id, Fdt_Sta_Id, Fdt_Date_Time), by = c("Ana_Sam_Fdt_Id" = "Fdt_Id"))
+
+basicData <- basicSummaryPlusSpatial(windowInfo, windowInfoAnalytes, WQM_Stations_Spatial, WQSlookup, WQSvalues)
+
+windowExceedanceAnalysisNEW <- basicData %>% 
+  filter(!is.na(WQS_ID)) %>% 
+  rowwise() %>% 
+  mutate(`Temperature Exceedance` = ifelse( signif(Temperature, digits = 2) > `Max Temperature (C)`, 1, 0),
+         `pH Exceedance` = ifelse(findInterval( signif(pH, digits = 2),c(`pH Min`,`pH Max`), left.open=TRUE, rightmost.closed = TRUE) == 1, 0, 1), 
+         # a bit of reverse logic bc findInterval returns 1 when inside interval, so have to throw opposite to get accurate exceedance count
+         `pH Exceedance Lake Correction` = case_when(LakeStratification %in% c('Epilimnion', NA) & `pH Exceedance` == 1 ~ 1,
+                                                     LakeStratification %in% c('Hypolimnion') & `pH Exceedance` == 1 ~ 0,
+                                                     TRUE ~ as.numeric(`pH Exceedance`)),
+         # drop any pH exceedances in the hypolimnion to adhere with assessment guidance
+         `Dissolved Oxygen Exceedance` =  ifelse(signif(`Dissolved Oxygen` , digits = 2) < `Dissolved Oxygen Min (mg/L)`,1,0))
+
+windowExceedancesNEW <- filter(windowExceedanceAnalysisNEW, `Temperature Exceedance` == 1 | `pH Exceedance` == 1 |  `Dissolved Oxygen Exceedance` == 1 ) %>% 
+  group_by(StationID, ASSESS_REG) %>% 
+  summarise(`Temperature Exceedance` = sum(`Temperature Exceedance`, na.rm = T), 
+            `pH Exceedance` = sum(`pH Exceedance Lake Correction`, na.rm = T), 
+            `Dissolved Oxygen Exceedance` = sum(`Dissolved Oxygen Exceedance`, na.rm = T))
+
+# quick way of getting answers
+View(
+windowExceedancesNEW %>% ungroup() %>% 
+  group_by(ASSESS_REG) %>% 
+  summarise(`Temperature Exceedance` = sum(`Temperature Exceedance`, na.rm = T), 
+            `pH Exceedance` = sum(`pH Exceedance`, na.rm = T), 
+            `Dissolved Oxygen Exceedance` = sum(`Dissolved Oxygen Exceedance`, na.rm = T)) %>% 
+  left_join(basicData %>% 
+              distinct(StationID, .keep_all = T) %>% 
+              group_by(ASSESS_REG) %>% 
+              count(!is.na(WQS_ID)) %>% 
+              mutate(sites = sum(n), 
+                     `Percent of Stations With WQS Information` = case_when(`!is.na(WQS_ID)` == TRUE ~ round(n / sites *100, digits = 1 ))) %>% 
+              filter(!is.na(`Percent of Stations With WQS Information`)) %>% 
+              dplyr::select(ASSESS_REG, `Number of Stations Sampled` = sites, `Percent of Stations With WQS Information`), 
+            by = 'ASSESS_REG') )
+```
+
+
+
+## Dig in to HF bacteria 
+
+```{r}
+filter(basicData, str_detect(`Run ID`, 'HF') ) %>% 
+  group_by(ASSESS_REG) %>% 
+  summarise(n())
+
+#View(filter(basicData, str_detect(`Run ID`, 'HF') & !is.na(Ecoli)) ) # then sort by date time and it seems like lab is ~ 10 days behind on Ecoli data
+
+# this way drops out data that hasn't been returned from the lab yet, not best way to get count of what was collected
+filter(basicData, str_detect(`Run ID`, 'HF') & !is.na(Ecoli)) %>% 
+  group_by(ASSESS_REG) %>% 
+  summarise(n())
+```
+
+Need to assess next, but first think though how we want to run the assessment functions. If we only pull 1 month at a time that won't capture real picture so maybe this report defaults to pulling data from year to date and then users can dig in to regions by month?
+
