@@ -15,6 +15,7 @@ library(lubridate)
 library(pool)
 library(pins)
 library(sqldf)
+library(dbplyr)
 
 # Server connection things
 conn <- config::get("connectionSettings") # get configuration settings
@@ -70,7 +71,7 @@ sampleWindow <- c(as.Date('2021-05-01'), as.Date('2021-05-31'))
 What basic data can we glean from Wqm_Field_Data_View plus some spatial info from the R server?
 
 ```{r}
-windowInfo <- pool %>% tbl( "Wqm_Field_Data_View") %>%
+windowInfo <- pool %>% tbl( in_schema("wqm", "Wqm_Field_Data_View")) %>%
   filter(between(as.Date(Fdt_Date_Time), !! sampleWindow[1], !! sampleWindow[2])) %>%
   as_tibble() %>% 
   left_join(WQM_Stations_Spatial, by = c("Fdt_Sta_Id" = "StationID")) #%>% 
@@ -160,7 +161,7 @@ windowExceedances %>% ungroup() %>%
 First pull analyte data for the stations and dates (by windowInfo$Fdt_Id)
 
 ```{r}
-windowInfoAnalytes <- pool %>% tbl("Wqm_Analytes_View") %>%
+windowInfoAnalytes <- pool %>% tbl(in_schema("wqm", "Wqm_Analytes_View")) %>%
   filter(Ana_Sam_Fdt_Id %in% !! windowInfo$Fdt_Id  &
            between(as.Date(Ana_Received_Date), !! sampleWindow[1], !! sampleWindow[2]) & # x >= left & x <= right
            Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") %>% 
@@ -176,11 +177,11 @@ basicData <- basicSummary(stationFieldAnalyteDataPretty(windowInfoAnalytes, wind
 ## side step: one function to rule them all
 
 ```{r}
-windowInfo <- pool %>% tbl( "Wqm_Field_Data_View") %>%
+windowInfo <- pool %>% tbl(in_schema("wqm", "Wqm_Field_Data_View")) %>%
   filter(between(as.Date(Fdt_Date_Time), !! sampleWindow[1], !! sampleWindow[2])) %>%
   as_tibble()
 
-windowInfoAnalytes <- pool %>% tbl("Wqm_Analytes_View") %>%
+windowInfoAnalytes <- pool %>% tbl(in_schema("wqm", "Wqm_Analytes_View")) %>%
   filter(Ana_Sam_Fdt_Id %in% !! windowInfo$Fdt_Id  &
            between(as.Date(Ana_Received_Date), !! sampleWindow[1], !! sampleWindow[2]) & # x >= left & x <= right
            Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") %>% 
